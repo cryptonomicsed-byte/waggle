@@ -120,12 +120,15 @@ pub mod waggle {
         let staker_cut = bounty.fee * STAKER_REWARD_BPS_OF_FEE / 10_000;
         let ops_cut = bounty.fee - buyback_cut - staker_cut;
 
-        token::transfer(
+        // Fee is already collected in WAGGLE, so "buyback" for this leg is just a
+        // direct burn — buying WAGGLE with WAGGLE and burning it has the identical
+        // supply effect, without the swap-account attack surface. See BUYBACK_SWAP.md.
+        token::burn(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
+                Burn {
+                    mint: ctx.accounts.mint.to_account_info(),
                     from: ctx.accounts.escrow_vault.to_account_info(),
-                    to: ctx.accounts.treasury_buyback_account.to_account_info(),
                     authority: ctx.accounts.bounty.to_account_info(),
                 },
                 signer,
@@ -171,6 +174,12 @@ pub mod waggle {
 
     /// Called once per Queen-tier arbiter vote. Simple 2-of-3 majority; each vote is
     /// its own tx so this doesn't need a big multisig account.
+    ///
+    /// Double-vote fix: `vote_record` is a PDA seeded on `(bounty, arbiter)` with
+    /// `init` (not `init_if_needed`) — a second `arbitrate` call from the same
+    /// arbiter on the same bounty fails at account-init time (`AccountAlreadyInUse`)
+    /// before any vote-count mutation happens, so re-submitting a vote (or trying to
+    /// flip it) can never double-count.
     pub fn arbitrate(ctx: Context<Arbitrate>, favors_worker: bool) -> Result<()> {
         let bounty = &mut ctx.accounts.bounty;
         require!(bounty.status == BountyStatus::Disputed, WaggleError::WrongStatus);
@@ -178,6 +187,12 @@ pub mod waggle {
             ctx.accounts.arbiter_stake.tier == StakeTier::Queen,
             WaggleError::NotQueenTier
         );
+
+        let vote_record = &mut ctx.accounts.vote_record;
+        vote_record.bounty = bounty.key();
+        vote_record.arbiter = ctx.accounts.arbiter.key();
+        vote_record.favors_worker = favors_worker;
+        vote_record.bump = ctx.bumps.vote_record;
 
         if favors_worker {
             bounty.votes_for_worker += 1;
@@ -233,9 +248,11 @@ pub mod waggle {
         Ok(())
     }
 
-    /// Stake WAGGLE into Forager or Queen tier. Tier is derived from amount at the
-    /// SDK layer; the program just records what was locked.
-    pub fn stake(ctx: Context<StakeCtx>, amount: u64, tier: StakeTier) -> Result<()> {
+    /// First-time stake: creates the staker's record. Split from `add_stake` on
+    /// purpose — an `init_if_needed` single entry point would silently reset
+    /// `amount`/`tier` on a second call instead of accumulating (a known Anchor
+    /// footgun), so "open" and "add" are separate, unambiguous instructions.
+    pub fn open_stake_account(ctx: Context<OpenStakeAccount>, amount: u64, tier: StakeTier) -> Result<()> {
         require!(
             stake_meets_tier(amount, tier),
             WaggleError::InsufficientStake
@@ -255,6 +272,29 @@ pub mod waggle {
         record.owner = ctx.accounts.staker.key();
         record.amount = amount;
         record.tier = tier;
+        Ok(())
+    }
+
+    /// Add to an existing stake record (e.g. Forager topping up to Queen tier).
+    /// Requires the record to already exist — will not silently create one.
+    pub fn add_stake(ctx: Context<AddStake>, additional_amount: u64, new_tier: StakeTier) -> Result<()> {
+        let record = &mut ctx.accounts.arbiter_stake;
+        let new_total = record.amount.checked_add(additional_amount).ok_or(WaggleError::Overflow)?;
+        require!(stake_meets_tier(new_total, new_tier), WaggleError::InsufficientStake);
+
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.staker_token_account.to_account_info(),
+                    to: ctx.accounts.stake_pool_vault.to_account_info(),
+                    authority: ctx.accounts.staker.to_account_info(),
+                },
+            ),
+            additional_amount,
+        )?;
+        record.amount = new_total;
+        record.tier = new_tier;
         Ok(())
     }
 }
@@ -308,6 +348,16 @@ pub struct ArbiterStake {
     pub tier: StakeTier,
 }
 
+/// One per (bounty, arbiter). Its existence is the double-vote guard: `init`
+/// fails if this arbiter already voted on this bounty.
+#[account]
+pub struct VoteRecord {
+    pub bounty: Pubkey,
+    pub arbiter: Pubkey,
+    pub favors_worker: bool,
+    pub bump: u8,
+}
+
 #[derive(Accounts)]
 #[instruction(nostr_event_id: [u8; 32])]
 pub struct CreateBounty<'info> {
@@ -354,7 +404,7 @@ pub struct ApproveAndRelease<'info> {
     #[account(mut)]
     pub worker_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub treasury_buyback_account: Account<'info, TokenAccount>,
+    pub mint: Account<'info, Mint>,
     #[account(mut)]
     pub treasury_staker_account: Account<'info, TokenAccount>,
     #[account(mut)]
@@ -373,11 +423,23 @@ pub struct Dispute<'info> {
 pub struct Arbitrate<'info> {
     #[account(mut)]
     pub bounty: Account<'info, Bounty>,
+    #[account(mut)]
     pub arbiter: Signer<'info>,
     #[account(has_one = owner @ WaggleError::NotStakeOwner)]
     pub arbiter_stake: Account<'info, ArbiterStake>,
     /// CHECK: verified via has_one on arbiter_stake
     pub owner: UncheckedAccount<'info>,
+    /// PDA per (bounty, arbiter); `init` makes a second vote from this arbiter
+    /// on this bounty fail instead of silently double-counting.
+    #[account(
+        init,
+        payer = arbiter,
+        space = 8 + 32 + 32 + 1 + 1,
+        seeds = [b"vote", bounty.key().as_ref(), arbiter.key().as_ref()],
+        bump
+    )]
+    pub vote_record: Account<'info, VoteRecord>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -396,7 +458,7 @@ pub struct CancelNoShow<'info> {
 }
 
 #[derive(Accounts)]
-pub struct StakeCtx<'info> {
+pub struct OpenStakeAccount<'info> {
     #[account(mut)]
     pub staker: Signer<'info>,
     #[account(mut)]
@@ -404,9 +466,28 @@ pub struct StakeCtx<'info> {
     #[account(mut)]
     pub stake_pool_vault: Account<'info, TokenAccount>,
     #[account(
-        init_if_needed,
+        init,
         payer = staker,
         space = 8 + 32 + 8 + 1,
+        seeds = [b"arbiter_stake", staker.key().as_ref()],
+        bump
+    )]
+    pub arbiter_stake: Account<'info, ArbiterStake>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AddStake<'info> {
+    #[account(mut)]
+    pub staker: Signer<'info>,
+    #[account(mut)]
+    pub staker_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub stake_pool_vault: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = arbiter_stake.owner == staker.key() @ WaggleError::NotStakeOwner,
         seeds = [b"arbiter_stake", staker.key().as_ref()],
         bump
     )]
