@@ -6,7 +6,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer, Burn};
 
-declare_id!("Wagg1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+declare_id!("4wGXNHsraHm5oxSJtWrTkkX7uh9sMMCMjoaKPFJdjyRy");
 
 pub const FEE_BPS: u64 = 300; // 3%
 pub const BUYBACK_BURN_BPS_OF_FEE: u64 = 5000; // 50% of fee
@@ -85,6 +85,13 @@ pub mod waggle {
     /// Requester approves delivered work; releases reward to worker, stake back to
     /// worker, and routes fee to treasury sub-accounts per TOKENOMICS.md split.
     pub fn approve_and_release(ctx: Context<ApproveAndRelease>) -> Result<()> {
+        // Captured before the `&mut` borrow below: `bounty`'s PDA is also the CPI
+        // signing authority, so every transfer/burn needs its AccountInfo while
+        // `bounty` (the typed state) is simultaneously borrowed mutably. Anchor
+        // account wrappers don't support borrowing the same field both ways at
+        // once, so the AccountInfo is taken up front instead of re-borrowing
+        // `ctx.accounts.bounty` inside each CpiContext.
+        let bounty_ai = ctx.accounts.bounty.to_account_info();
         let bounty = &mut ctx.accounts.bounty;
         require!(bounty.status == BountyStatus::InProgress, WaggleError::WrongStatus);
 
@@ -97,7 +104,7 @@ pub mod waggle {
                 Transfer {
                     from: ctx.accounts.escrow_vault.to_account_info(),
                     to: ctx.accounts.worker_token_account.to_account_info(),
-                    authority: ctx.accounts.bounty.to_account_info(),
+                    authority: bounty_ai.clone(),
                 },
                 signer,
             ),
@@ -109,7 +116,7 @@ pub mod waggle {
                 Transfer {
                     from: ctx.accounts.stake_vault.to_account_info(),
                     to: ctx.accounts.worker_token_account.to_account_info(),
-                    authority: ctx.accounts.bounty.to_account_info(),
+                    authority: bounty_ai.clone(),
                 },
                 signer,
             ),
@@ -129,7 +136,7 @@ pub mod waggle {
                 Burn {
                     mint: ctx.accounts.mint.to_account_info(),
                     from: ctx.accounts.escrow_vault.to_account_info(),
-                    authority: ctx.accounts.bounty.to_account_info(),
+                    authority: bounty_ai.clone(),
                 },
                 signer,
             ),
@@ -141,7 +148,7 @@ pub mod waggle {
                 Transfer {
                     from: ctx.accounts.escrow_vault.to_account_info(),
                     to: ctx.accounts.treasury_staker_account.to_account_info(),
-                    authority: ctx.accounts.bounty.to_account_info(),
+                    authority: bounty_ai.clone(),
                 },
                 signer,
             ),
@@ -153,7 +160,7 @@ pub mod waggle {
                 Transfer {
                     from: ctx.accounts.escrow_vault.to_account_info(),
                     to: ctx.accounts.treasury_ops_account.to_account_info(),
-                    authority: ctx.accounts.bounty.to_account_info(),
+                    authority: bounty_ai,
                 },
                 signer,
             ),
@@ -211,6 +218,7 @@ pub mod waggle {
     /// Bidder never delivered past deadline: stake is burned in full, reward+fee
     /// returns to requester.
     pub fn cancel_no_show(ctx: Context<CancelNoShow>) -> Result<()> {
+        let bounty_ai = ctx.accounts.bounty.to_account_info();
         let bounty = &mut ctx.accounts.bounty;
         require!(bounty.status == BountyStatus::InProgress, WaggleError::WrongStatus);
         require!(Clock::get()?.unix_timestamp > bounty.deadline, WaggleError::NotExpired);
@@ -224,7 +232,7 @@ pub mod waggle {
                 Burn {
                     mint: ctx.accounts.mint.to_account_info(),
                     from: ctx.accounts.stake_vault.to_account_info(),
-                    authority: ctx.accounts.bounty.to_account_info(),
+                    authority: bounty_ai.clone(),
                 },
                 signer,
             ),
@@ -237,7 +245,7 @@ pub mod waggle {
                 Transfer {
                     from: ctx.accounts.escrow_vault.to_account_info(),
                     to: ctx.accounts.requester_token_account.to_account_info(),
-                    authority: ctx.accounts.bounty.to_account_info(),
+                    authority: bounty_ai,
                 },
                 signer,
             ),
